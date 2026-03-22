@@ -56,7 +56,8 @@
       "^https:\\/\\/(?:[^/]*\\.)?zoom\\.us(/.*)?$",
       "^https:\\/\\/github\\.com(/.*)?$",
       "^https:\\/\\/[^/]*\\.github\\.com(/.*)?$",
-      "^https:\\/\\/[^/]*\\.github\\.io(/.*)?$"
+      "^https:\\/\\/[^/]*\\.github\\.io(/.*)?$",
+      "^https:\\/\\/my\\.cleanbrowsing\\.org(/.*)?$"
     ],
     "context_indicators": {
       "description": "Additional context that indicates legitimate discussion vs phishing",
