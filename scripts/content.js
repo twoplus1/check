@@ -30,8 +30,8 @@ if (window.checkExtensionLoaded) {
   let developerConsoleLoggingEnabled = false; // Cache for developer console logging setting
   let showingBanner = false; // Flag to prevent DOM monitoring loops when showing banners
   let escalatedToBlock = false; // Flag to indicate page has been escalated to block - stop all monitoring
-  const MAX_SCANS = 5; // Prevent infinite scanning - reduced for performance
-  const SCAN_COOLDOWN = 1200; // 1200ms between scans - increased for performance
+  const MAX_SCANS = 8; // Allow more rescans for dynamically loaded content
+  const SCAN_COOLDOWN = 800; // 800ms between scans - allow faster rescans for dynamic content
   const THREAT_TRIGGERED_COOLDOWN = 500; // Shorter cooldown for threat-triggered re-scans
   const WARNING_THRESHOLD = 3; // Block if 4+ warning threats found (escalation threshold)
   const PHISHING_PROCESSING_TIMEOUT = 10000; // 10 second timeout for phishing indicator processing
@@ -3960,7 +3960,136 @@ if (window.checkExtensionLoaded) {
         }`
       );
 
-      // Step 4: Pre-check domain for obvious non-threats only
+      // Step 4: Check for domain squatting (typosquatting, homoglyphs, etc.)
+      // This runs BEFORE phishing detection to catch domain-based threats early
+      try {
+        const domainSquattingResult = await chrome.runtime.sendMessage({
+          type: "check_domain_squatting",
+          domain: window.location.hostname
+        });
+        
+        if (domainSquattingResult?.success && domainSquattingResult.result?.detected) {
+          const squattingData = domainSquattingResult.result;
+          logger.warn(`⚠️ DOMAIN SQUATTING DETECTED:`);
+          logger.warn(`  Test Domain: ${squattingData.testDomain}`);
+          logger.warn(`  Protected Domain: ${squattingData.protectedDomain}`);
+          logger.warn(`  Techniques: ${squattingData.techniques.map(t => t.technique).join(', ')}`);
+          logger.warn(`  Severity: ${squattingData.severity}`);
+          logger.warn(`  Confidence: ${(squattingData.confidence * 100).toFixed(1)}%`);
+          logger.warn(`  Action: ${squattingData.action || 'warn'}`);
+          
+          // Check if notifications should be shown
+          const showNotifications = config.showNotifications !== false;
+          
+          // Determine if we should block the page
+          // Requires: 1) enablePageBlocking is ON, 2) domain_squatting action is "block"
+          logger.debug(`  enablePageBlocking: ${config.enablePageBlocking}`);
+          logger.debug(`  squattingData.action: ${squattingData.action}`);
+          const shouldBlock = squattingData.action === 'block' && 
+                             config.enablePageBlocking !== false;
+          logger.debug(`  shouldBlock: ${shouldBlock}`);
+          
+          // Log domain squatting detection
+          logProtectionEvent({
+            type: "threat_detected",
+            action: shouldBlock ? "blocked" : "warned",
+            url: location.href,
+            origin: currentOrigin,
+            reason: `Domain squatting detected: ${squattingData.techniques.map(t => t.description).join('; ')}`,
+            severity: squattingData.severity,
+            redirectTo: null,
+            clientId: null,
+            ruleType: "domain_squatting",
+            squattingDetails: squattingData
+          });
+          
+          // Send CIPP report for domain squatting detection
+          sendCippReport({
+            type: "domain_squatting_detected",
+            url: defangUrl(location.href),
+            origin: currentOrigin,
+            testDomain: squattingData.testDomain,
+            protectedDomain: squattingData.protectedDomain,
+            techniques: squattingData.techniques.map(t => ({
+              ...t
+            })),
+            severity: squattingData.severity,
+            confidence: squattingData.confidence,
+            action: shouldBlock ? "blocked" : "warned",
+            reason: `Domain squatting detected: ${squattingData.techniques.map(t => t.description).join('; ')}`
+          });
+          
+          // Send domain_squatting_detected webhook
+          chrome.runtime
+            .sendMessage({
+              type: "send_webhook",
+              webhookType: "domain_squatting_detected",
+              data: {
+                url: defangUrl(location.href),
+                testDomain: squattingData.testDomain,
+                protectedDomain: squattingData.protectedDomain,
+                techniques: squattingData.techniques.map(t => ({
+                  technique: t.technique,
+                  description: t.description
+                })),
+                severity: squattingData.severity,
+                confidence: squattingData.confidence,
+                action: shouldBlock ? "blocked" : "warned",
+                reason: `Domain squatting detected: ${squattingData.techniques.map(t => t.description).join('; ')}`
+              },
+            })
+            .catch((err) => {
+              logger.debug("Failed to send domain squatting webhook:", err);
+            });
+          
+          if (shouldBlock) {
+            // Block the page - redirect to blocked page with domain squatting context
+            const techniquesDesc = squattingData.techniques.map(t => 
+              `${t.technique}: ${t.description}`
+            ).join('; ');
+            
+            await showBlockingOverlay(
+              `Domain Squatting: This site closely resembles "${squattingData.protectedDomain}" but is not the legitimate site`,
+              {
+                type: "domain_squatting",
+                severity: squattingData.severity,
+                testDomain: squattingData.testDomain,
+                protectedDomain: squattingData.protectedDomain,
+                techniques: squattingData.techniques,
+                confidence: squattingData.confidence,
+                reason: `Domain squatting detected: ${techniquesDesc}`,
+                detectionMethod: "domain-squatting",
+                detectionTime: Date.now()
+              }
+            );
+            return; // Stop processing, page is blocked
+          } else if (showNotifications) {
+            // Show warning banner for domain squatting (only if notifications enabled)
+            const techniquesDesc = squattingData.techniques.map(t => 
+              `${t.technique}: ${t.description}`
+            ).join('\n');
+            
+            showWarningBanner(
+              `⚠️ POTENTIAL DOMAIN SQUATTING: This domain closely resembles "${squattingData.protectedDomain}"`,
+              {
+                type: "domain_squatting",
+                severity: squattingData.severity,
+                reason: `Domain squatting techniques detected:\n${techniquesDesc}`,
+                protectedDomain: squattingData.protectedDomain,
+                confidence: squattingData.confidence,
+                techniques: squattingData.techniques
+              }
+            );
+          }
+          
+          // If we showed a warning but not blocking, continue with phishing detection
+          // If we blocked, we already returned above
+        }
+      } catch (squattingError) {
+        logger.debug("Domain squatting check failed or disabled:", squattingError.message);
+      }
+
+      // Step 5: Pre-check domain for obvious non-threats only
       // NOTE: We removed the restrictive domain check that was blocking training platforms
       // like KnowBe4. Phishing simulations use legitimate domains but copy Microsoft UI.
       // Let content-based detection handle all cases.
@@ -3972,7 +4101,7 @@ if (window.checkExtensionLoaded) {
         `Analyzing domain "${currentDomain}" - proceeding with content-based detection`
       );
 
-      // Step 5: Check if page is an MS logon page (using rule file requirements)
+      // Step 6: Check if page is an MS logon page (using rule file requirements)
       const msDetection = detectMicrosoftElements();
       if (!msDetection.isLogonPage) {
         // Check if page has ANY Microsoft-related elements before running expensive phishing indicators
@@ -5358,6 +5487,8 @@ if (window.checkExtensionLoaded) {
       });
 
       // Fallback: Check periodically for content that might have loaded without triggering observer
+      let fallbackCheckCount = 0;
+      const MAX_FALLBACK_CHECKS = 5; // Allow up to 5 fallback checks
       const checkInterval = setInterval(() => {
         // Stop if page has been escalated to block
         if (escalatedToBlock) {
@@ -5376,17 +5507,27 @@ if (window.checkExtensionLoaded) {
           return;
         }
 
+        fallbackCheckCount++;
         const currentElementCount = document.querySelectorAll("*").length;
         const hasSignificantContent = document.body?.textContent?.length > 1000;
 
         if (hasSignificantContent && currentElementCount > 50) {
           logger.log(
-            "⏰ Fallback timer detected significant content - re-running analysis"
+            `⏰ Fallback timer detected significant content - re-running analysis (check ${fallbackCheckCount}/${MAX_FALLBACK_CHECKS})`
           );
-          clearInterval(checkInterval);
           runProtection(true);
+          
+          // Stop after MAX_FALLBACK_CHECKS successful rescans
+          if (fallbackCheckCount >= MAX_FALLBACK_CHECKS) {
+            logger.log("⏰ Maximum fallback checks reached - stopping");
+            clearInterval(checkInterval);
+          }
+        } else if (fallbackCheckCount >= MAX_FALLBACK_CHECKS) {
+          // Stop after MAX_FALLBACK_CHECKS attempts even if no significant content
+          logger.debug("⏰ Maximum fallback check attempts reached - stopping");
+          clearInterval(checkInterval);
         }
-      }, 2000);
+      }, 1500); // Check every 1.5 seconds
 
       // Stop monitoring after 30 seconds to prevent resource drain
       setTimeout(() => {
@@ -5820,6 +5961,20 @@ if (window.checkExtensionLoaded) {
         bannerIcon = "🔍";
         bannerColor = "linear-gradient(135deg, #2196f3, #1976d2)"; // Blue for scanning
       }
+      // Check for domain squatting detection - tailored messaging
+      else if (
+        analysisData?.type === "domain_squatting" ||
+        reason.toLowerCase().includes("domain squatting") ||
+        reason.toLowerCase().includes("typosquat")
+      ) {
+        bannerTitle = "⚠️ Suspicious Domain Detected";
+        bannerIcon = "🔗";
+        bannerColor = "linear-gradient(135deg, #ff5722, #d84315)"; // Same orange-red as high risk warnings
+        // Override reason text for domain squatting to be more user-friendly
+        if (analysisData?.protectedDomain) {
+          reason = `This website's domain looks similar to "${analysisData.protectedDomain}" but is NOT the legitimate site. Be careful entering any credentials.`;
+        }
+      }
       // Check for rogue app detection
       else if (
         analysisData?.type === "rogue_app_on_legitimate_domain" ||
@@ -5841,7 +5996,7 @@ if (window.checkExtensionLoaded) {
 
       // Layout: left branding slot, absolutely centered message block, dismiss button on right.
       const bannerContent = `
-        <div style="position:relative;display:flex;align-items:center;gap:16px;min-height:56px;">
+        <div style="position:relative;display:flex;align-items:center;gap:16px;min-height:56px;padding-right:40px;">
           <div id="check-banner-left" style="display:flex;align-items:center;gap:12px;z-index:2;"></div>
           <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;max-width:60%;z-index:1;pointer-events:none;">
             <span style="display:block;font-size:24px;margin-bottom:4px;">${bannerIcon}</span>
@@ -5849,10 +6004,10 @@ if (window.checkExtensionLoaded) {
             <small style="opacity:0.95;display:block;margin-top:2px;">${reason}${detailsText}</small>
           </div>
           <button onclick="this.closest('#ms365-warning-banner').remove(); document.body.style.marginTop = '0'; window.showingBanner = false;" title="Dismiss" style="
-            margin-left:auto;position:relative;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.3);
+            position:absolute;right:16px;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.3);
             color:#fff;padding:0;border-radius:4px;cursor:pointer;
             width:24px;height:24px;min-width:24px;min-height:24px;display:flex;align-items:center;justify-content:center;
-            font-size:14px;font-weight:bold;line-height:1;box-sizing:border-box;font-family:monospace;z-index:2;">×</button>
+            font-size:14px;font-weight:bold;line-height:1;box-sizing:border-box;font-family:monospace;z-index:3;">×</button>
         </div>`;
 
       // Check if banner already exists
@@ -6457,11 +6612,100 @@ if (window.checkExtensionLoaded) {
   }
 
   /**
+   * Track network activity for better timing detection
+   */
+  let pendingRequests = 0;
+  let networkIdleTimer = null;
+  let lastNetworkActivity = Date.now();
+
+  /**
+   * Monitor fetch/XHR to detect when network is idle
+   */
+  function setupNetworkMonitoring() {
+    // Intercept fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(...args) {
+      pendingRequests++;
+      lastNetworkActivity = Date.now();
+      logger.debug(`🌐 Fetch request started (pending: ${pendingRequests})`);
+      
+      return originalFetch.apply(this, arguments).finally(() => {
+        pendingRequests--;
+        lastNetworkActivity = Date.now();
+        logger.debug(`🌐 Fetch request completed (pending: ${pendingRequests})`);
+        checkNetworkIdle();
+      });
+    };
+
+    // Intercept XMLHttpRequest
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    
+    XMLHttpRequest.prototype.open = function(...args) {
+      this._check_tracked = true;
+      return originalOpen.apply(this, args);
+    };
+    
+    XMLHttpRequest.prototype.send = function(...args) {
+      if (this._check_tracked) {
+        pendingRequests++;
+        lastNetworkActivity = Date.now();
+        logger.debug(`🌐 XHR request started (pending: ${pendingRequests})`);
+        
+        this.addEventListener('loadend', () => {
+          pendingRequests--;
+          lastNetworkActivity = Date.now();
+          logger.debug(`🌐 XHR request completed (pending: ${pendingRequests})`);
+          checkNetworkIdle();
+        });
+      }
+      return originalSend.apply(this, args);
+    };
+  }
+
+  /**
+   * Check if network has been idle for a period
+   */
+  function checkNetworkIdle() {
+    if (networkIdleTimer) {
+      clearTimeout(networkIdleTimer);
+    }
+    
+    // Wait 300ms after last network activity before considering network "idle"
+    networkIdleTimer = setTimeout(() => {
+      if (pendingRequests === 0) {
+        const timeSinceActivity = Date.now() - lastNetworkActivity;
+        if (timeSinceActivity >= 300) {
+          logger.log("🌐 Network idle detected - content likely loaded");
+          // Trigger a scan if we haven't scanned recently
+          if (scanCount < MAX_SCANS && !showingBanner && !escalatedToBlock) {
+            logger.log("🔄 Triggering scan after network idle");
+            runProtection(true);
+          }
+        }
+      }
+    }, 300);
+  }
+
+  /**
+   * Check if critical elements exist (forms, inputs, etc.)
+   */
+  function hasCriticalElements() {
+    const hasForm = document.querySelector('form') !== null;
+    const hasPasswordInput = document.querySelector('input[type="password"]') !== null;
+    const hasEmailInput = document.querySelector('input[type="email"]') !== null;
+    const hasTextInput = document.querySelectorAll('input[type="text"]').length > 0;
+    
+    return hasForm || hasPasswordInput || hasEmailInput || hasTextInput;
+  }
+
+  /**
    * Initialize protection when DOM is ready
    */
   function initializeProtection() {
     try {
       logger.log("Initializing Check");
+      logger.log(`Initial document.readyState: ${document.readyState}`);
 
       // Console capture is now setup only when developer mode is enabled (see loadDeveloperConsoleLoggingSetting)
       // This eliminates performance overhead for normal users
@@ -6471,15 +6715,121 @@ if (window.checkExtensionLoaded) {
 
       // Setup dynamic script monitoring early to catch any immediate script execution
       setupDynamicScriptMonitoring();
+      
+      // Setup network monitoring for better timing detection
+      setupNetworkMonitoring();
 
+      // Track when we've completed different loading stages
+      let domContentLoadedFired = false;
+      let windowLoadFired = false;
+      let initialScanDone = false;
+
+      /**
+       * Perform initial scan with smart timing
+       */
+      function performInitialScan() {
+        if (initialScanDone) {
+          logger.debug("Initial scan already completed, skipping");
+          return;
+        }
+        
+        initialScanDone = true;
+        logger.log("📊 Performing initial scan");
+        logger.log(`  - DOMContentLoaded: ${domContentLoadedFired}`);
+        logger.log(`  - window.load: ${windowLoadFired}`);
+        logger.log(`  - Pending requests: ${pendingRequests}`);
+        logger.log(`  - Critical elements: ${hasCriticalElements()}`);
+        
+        runProtection();
+      }
+
+      // Strategy 1: Wait for DOMContentLoaded if still loading
       if (document.readyState === "loading") {
+        logger.log("⏳ Document still loading, waiting for DOMContentLoaded");
+        
         document.addEventListener("DOMContentLoaded", () => {
-          setTimeout(runProtection, 100); // Small delay to ensure DOM is stable
+          domContentLoadedFired = true;
+          logger.log("✅ DOMContentLoaded fired");
+          
+          // Check if critical elements already exist
+          if (hasCriticalElements()) {
+            logger.log("🎯 Critical elements detected immediately after DOMContentLoaded");
+            // Scan quickly if we have forms/inputs
+            setTimeout(performInitialScan, 200);
+          } else {
+            // Wait a bit longer for dynamic content
+            setTimeout(performInitialScan, 600);
+          }
         });
       } else {
-        // DOM already ready
-        setTimeout(runProtection, 100);
+        // DOM already loaded
+        domContentLoadedFired = true;
+        logger.log("✅ Document already loaded (readyState: " + document.readyState + ")");
+        
+        if (hasCriticalElements()) {
+          logger.log("🎯 Critical elements already present");
+          // Scan quickly if we have forms/inputs
+          setTimeout(performInitialScan, 200);
+        } else {
+          // Wait longer for dynamic content to load
+          setTimeout(performInitialScan, 800);
+        }
       }
+
+      // Strategy 2: Also wait for window.load event (all resources loaded)
+      if (document.readyState !== "complete") {
+        window.addEventListener("load", () => {
+          windowLoadFired = true;
+          logger.log("✅ Window load event fired (all resources loaded)");
+          
+          // Trigger another scan if initial scan was too early
+          if (initialScanDone && !hasCriticalElements() && scanCount < MAX_SCANS) {
+            logger.log("🔄 Re-scanning after window.load as critical elements may have loaded");
+            setTimeout(() => runProtection(true), 300);
+          }
+        });
+      } else {
+        windowLoadFired = true;
+        logger.log("✅ Window already fully loaded");
+      }
+
+      // Strategy 3: Monitor for critical elements appearing
+      // If we scan early and find nothing, watch for forms/inputs to appear
+      const criticalElementObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.type === "childList") {
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType === Node.ELEMENT_NODE) {
+                const tagName = node.tagName?.toLowerCase();
+                // If a form or input appears, trigger immediate scan
+                if (tagName === "form" || tagName === "input") {
+                  logger.log("🎯 Critical element detected via observer: " + tagName);
+                  criticalElementObserver.disconnect();
+                  
+                  if (scanCount < MAX_SCANS && !showingBanner && !escalatedToBlock) {
+                    logger.log("🔄 Triggering immediate scan");
+                    runProtection(true);
+                  }
+                  return;
+                }
+              }
+            }
+          }
+        }
+      });
+
+      // Start observing for critical elements
+      criticalElementObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+
+      // Stop observing after 5 seconds
+      setTimeout(() => {
+        criticalElementObserver.disconnect();
+        logger.debug("Critical element observer stopped");
+      }, 5000);
+
     } catch (error) {
       logger.error("Failed to initialize protection:", error.message);
     }
