@@ -61,7 +61,8 @@
       "^https:\\/\\/github\\.com(/.*)?$",
       "^https:\\/\\/[^/]*\\.github\\.com(/.*)?$",
       "^https:\\/\\/[^/]*\\.github\\.io(/.*)?$",
-      "^https:\\/\\/(?:[^/]*\\.)?britishgas\\.co\\.uk(/.*)?$"
+      "^https:\\/\\/(?:[^/]*\\.)?britishgas\\.co\\.uk(/.*)?$",
+      "^https:\\/\\/(?:[^/]*\\.)?homeoffice\\.gov\\.uk(/.*)?$"
     ],
     "context_indicators": {
       "description": "Additional context that indicates legitimate discussion vs phishing",
